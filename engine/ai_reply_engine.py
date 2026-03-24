@@ -1,6 +1,7 @@
 """
 Step 3: AI Auto-Reply Engine
-- Monitors support@uniram.com for new unread emails
+- Monitors support@uniram.com Inbox for all emails (read and unread)
+- Moves processed emails to Processed subfolder under Inbox
 - Classifies each email (technical vs non-technical)
 - Retrieves relevant context from ChromaDB knowledge base
 - Generates a professional reply using GPT-4o
@@ -124,19 +125,24 @@ def get_graph_token():
     _token_cache["expires"] = time.time() + data.get("expires_in", 3600)
     return _token_cache["token"]
 
-def get_unread_emails(mailbox: str, max_count: int = 20):
+def get_inbox_emails(mailbox: str, max_count: int = 50):
+    """Get all emails from Inbox (not Processed subfolder) regardless of read status."""
     token = get_graph_token()
+    # Fetch from Inbox directly — Processed is a subfolder so won't appear here
     r = requests.get(
-        f"https://graph.microsoft.com/v1.0/users/{mailbox}/messages",
+        f"https://graph.microsoft.com/v1.0/users/{mailbox}/mailFolders/Inbox/messages",
         headers={"Authorization": f"Bearer {token}"},
         params={
-            "$filter": "isRead eq false",
             "$top": max_count,
             "$select": "id,subject,from,toRecipients,ccRecipients,receivedDateTime,body,bodyPreview,conversationId",
             "$orderby": "receivedDateTime asc"
         }
     )
     return r.json().get("value", []) if r.status_code == 200 else []
+
+def get_unread_emails(mailbox: str, max_count: int = 50):
+    """Alias for backward compatibility — now returns all inbox emails."""
+    return get_inbox_emails(mailbox, max_count)
 
 def mark_as_read(mailbox: str, message_id: str):
     token = get_graph_token()
@@ -744,7 +750,7 @@ def should_skip(email: dict) -> bool:
 
 def process_emails(dry_run: bool = False, kb_path: str = DEFAULT_KB_PATH):
     print(f"\n{'='*60}")
-    print(f"  Uniram AI Support — Auto-Reply Engine v2")
+    print(f"  Uniram AI Support — Auto-Reply Engine v18")
     print(f"  Mode: {'DRY RUN (no emails sent)' if dry_run else 'LIVE'}")
     print(f"  Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}\n")
@@ -804,8 +810,8 @@ def process_emails(dry_run: bool = False, kb_path: str = DEFAULT_KB_PATH):
             print(f"  [history] Error: {e}")
         print()
 
-    emails = get_unread_emails(SUPPORT_MAILBOX, max_count=20)
-    print(f"Found {len(emails)} unread emails in {SUPPORT_MAILBOX}\n")
+    emails = get_inbox_emails(SUPPORT_MAILBOX, max_count=50)
+    print(f"Found {len(emails)} emails in Inbox (all, not just unread) for {SUPPORT_MAILBOX}\n")
 
     if not emails:
         print("  Nothing to process.")
