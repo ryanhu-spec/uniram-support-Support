@@ -50,3 +50,5 @@ Push to `main` → GitHub Actions → auto-deploy to Azure Function App.
 | `AzureWebJobsStorage` | Azure Storage connection string (for KB persistence) |
 | `LEARN_HISTORY` | `true` to enable historical folder learning |
 | `LEARN_HISTORY_FOLDER` | Current folder being processed (auto-advances) |
+
+Last deployed: 2026-03-24 02:05 UTC
