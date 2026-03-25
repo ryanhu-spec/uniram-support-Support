@@ -9,6 +9,7 @@ Step 3: AI Auto-Reply Engine
 - Escalates to Ken if confidence is low or question is too complex
 - Auto-learns: saves new Ken/Finn replies back to knowledge base
 - v19: Confidence threshold 0.65→0.45; smarter skip for internally-handled threads
+- v20: Ken approval flow — medium confidence (0.45–0.80) sends draft to Ken with Approve/Reject buttons
 
 Changelog:
 - v2: Signature updated to "Technical Support" (single name Jennifer)
@@ -36,8 +37,11 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY, base_url="https://api.openai.com/
 ESCALATION_EMAIL     = "ken@uniram.com"
 ESCALATION_CC        = "finn.sun@uniram.com"
 CONFIDENCE_THRESHOLD = 0.45  # Lowered from 0.65 — Jennifer should attempt to answer more
+AUTO_SEND_THRESHOLD  = 0.80  # Above this: send directly without Ken approval
 DEFAULT_KB_PATH      = "/tmp/uniram_kb"
 LOG_PATH             = "/tmp/reply_log.jsonl"
+FUNCTION_APP_URL     = os.environ.get("FUNCTION_APP_URL", "https://uniram-support.azurewebsites.net")
+FUNCTION_KEY         = os.environ.get("FUNCTION_KEY", "")
 
 # ─────────────────────────────────────────────
 # Uni-ram logo (inline base64 — loaded once at startup)
@@ -522,10 +526,87 @@ Return as JSON: {{"reply": "...", "confidence": 0.0-1.0, "needs_escalation": tru
             result.get("needs_escalation", False), result.get("escalation_reason", ""))
 
 # ─────────────────────────────────────────────
-# Escalation to Ken
+# Approval request to Ken (with Approve/Reject buttons)
 # ─────────────────────────────────────────────
+def send_approval_to_ken(email: dict, classification: dict, draft_reply: str,
+                         confidence: float, dry_run: bool = False) -> bool:
+    """Send Ken a draft reply for approval with Approve/Reject buttons."""
+    from engine.pending_approvals import save_pending
+
+    subject = email.get("subject", "")
+    sender_name = get_sender_name(email)
+    sender_addr = get_sender_address(email)
+    body_text = extract_text(email)[:800]
+    received = email.get("receivedDateTime", "")[:10]
+    product = classification.get('product_model') or 'Not specified'
+    category = classification.get('category', '')
+
+    # Save pending state to Blob Storage
+    token = save_pending(email, draft_reply, classification, confidence) if not dry_run else "DRYRUN"
+
+    # Build Approve/Reject URLs
+    key_param = f"&code={FUNCTION_KEY}" if FUNCTION_KEY else ""
+    approve_url = (
+        f"{FUNCTION_APP_URL}/api/approve_support_reply"
+        f"?token={token}&action=approve{key_param}"
+    )
+    reject_url = (
+        f"{FUNCTION_APP_URL}/api/approve_support_reply"
+        f"?token={token}&action=reject{key_param}"
+    )
+
+    draft_html = draft_reply.replace("\n", "<br>")
+
+    approval_body = f"""<div style="font-family:Arial,sans-serif;font-size:14px;color:#333;max-width:700px;">
+<p>Hi Ken,</p>
+<p>Jennifer drafted a reply for this support email. Please review and <b>Approve</b> to send it to the customer, or <b>Reject</b> to provide the correct answer.</p>
+
+<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:13px;margin-bottom:16px;">
+  <tr><td><b>From</b></td><td>{sender_name} &lt;{sender_addr}&gt;</td></tr>
+  <tr><td><b>Subject</b></td><td>{subject}</td></tr>
+  <tr><td><b>Received</b></td><td>{received}</td></tr>
+  <tr><td><b>Category</b></td><td>{category}</td></tr>
+  <tr><td><b>Product</b></td><td>{product}</td></tr>
+  <tr><td><b>AI Confidence</b></td><td>{confidence:.0%}</td></tr>
+</table>
+
+<p><b>Customer's message:</b></p>
+<blockquote style="border-left:3px solid #ccc;padding-left:12px;color:#555;margin:8px 0;">{body_text}</blockquote>
+
+<p><b>Jennifer's draft reply:</b></p>
+<blockquote style="border-left:4px solid #FFD700;padding:12px 16px;background:#fffdf0;border-radius:4px;margin:8px 0;">{draft_html}</blockquote>
+
+<p style="margin-top:24px;">
+  <a href="{approve_url}" style="display:inline-block;background:#28a745;color:#fff;padding:12px 28px;border-radius:6px;text-decoration:none;font-weight:bold;font-size:15px;margin-right:12px;">✅ Approve &amp; Send</a>
+  <a href="{reject_url}" style="display:inline-block;background:#dc3545;color:#fff;padding:12px 28px;border-radius:6px;text-decoration:none;font-weight:bold;font-size:15px;">✏️ Reject &amp; Teach</a>
+</p>
+
+<p style="margin-top:16px;font-size:12px;color:#888;">If approved, Jennifer will send the reply to {sender_addr} and CC you.<br>
+If rejected, you'll be asked to provide the correct answer — Jennifer will learn from it and send it to the customer.</p>
+<p style="color:#aaa;font-size:11px;">— Uniram AI Support System (token: {token})</p>
+</div>"""
+
+    approval_subject = f"[Jennifer Review] {subject}"
+
+    if dry_run:
+        print(f"\n  [DRY RUN] Would send approval request to {ESCALATION_EMAIL}")
+        print(f"  Subject: {approval_subject}")
+        print(f"  Confidence: {confidence:.0%}")
+        print(f"  Draft: {draft_reply[:200]}")
+        return True
+
+    return send_email(
+        from_mailbox=SUPPORT_MAILBOX,
+        to_addresses=[ESCALATION_EMAIL],
+        cc_addresses=[ESCALATION_CC],
+        subject=approval_subject,
+        body_html=approval_body
+    )
+
+
 def escalate_to_ken(email: dict, classification: dict, ai_draft: str,
                     escalation_reason: str, dry_run: bool = False) -> bool:
+    """Escalate to Ken when Jennifer has no draft (low confidence / safety critical)."""
     subject = email.get("subject", "")
     sender_name = get_sender_name(email)
     sender_addr = get_sender_address(email)
@@ -533,21 +614,18 @@ def escalate_to_ken(email: dict, classification: dict, ai_draft: str,
     received = email.get("receivedDateTime", "")[:10]
 
     escalation_body = f"""<p>Hi Ken,</p>
-<p>An incoming support email needs your attention. The AI assistant couldn't resolve this one with sufficient confidence.</p>
+<p>An incoming support email needs your attention. Jennifer couldn't generate a confident reply for this one.</p>
 <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:14px;">
   <tr><td><b>From</b></td><td>{sender_name} &lt;{sender_addr}&gt;</td></tr>
   <tr><td><b>Subject</b></td><td>{subject}</td></tr>
   <tr><td><b>Received</b></td><td>{received}</td></tr>
   <tr><td><b>Category</b></td><td>{classification.get('category', '')}</td></tr>
   <tr><td><b>Product</b></td><td>{classification.get('product_model') or 'Not specified'}</td></tr>
-  <tr><td><b>Reason for escalation</b></td><td>{escalation_reason}</td></tr>
+  <tr><td><b>Reason</b></td><td>{escalation_reason}</td></tr>
 </table>
 <br>
 <p><b>Customer's message:</b></p>
 <blockquote style="border-left:3px solid #ccc;padding-left:12px;color:#555;">{body_text}</blockquote>
-<br>
-<p><b>AI draft reply (for reference):</b></p>
-<blockquote style="border-left:3px solid #f90;padding-left:12px;color:#555;">{ai_draft.replace(chr(10), '<br>')}</blockquote>
 <br>
 <p>Please reply directly to the customer at <a href="mailto:{sender_addr}">{sender_addr}</a>.</p>
 <p style="color:#888;font-size:12px;">— Uniram AI Support System</p>"""
@@ -784,7 +862,7 @@ def should_skip(email: dict) -> bool:
 
 def process_emails(dry_run: bool = False, kb_path: str = DEFAULT_KB_PATH):
     print(f"\n{'='*60}")
-    print(f"  Uniram AI Support — Auto-Reply Engine v19")
+    print(f"  Uniram AI Support — Auto-Reply Engine v20")
     print(f"  Mode: {'DRY RUN (no emails sent)' if dry_run else 'LIVE'}")
     print(f"  Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}\n")
@@ -1027,34 +1105,37 @@ def process_emails(dry_run: bool = False, kb_path: str = DEFAULT_KB_PATH):
             log_action(email, classification, "escalated_safety_critical", 0)
             continue
 
-        # Step 5: Reply or escalate
-        if confidence >= CONFIDENCE_THRESHOLD and not needs_escalation:
+        # Step 5: Route based on confidence
+        #   >= AUTO_SEND_THRESHOLD (0.80): send directly, no Ken review needed
+        #   < AUTO_SEND_THRESHOLD: always send draft to Ken for Approve/Reject
+        #     (even low confidence / needs_escalation — Ken always gets a draft to work from)
+        if confidence >= AUTO_SEND_THRESHOLD and not needs_escalation:
+            # High confidence — send directly to customer
             reply_html = build_reply_html(reply_text, email)
-
             if dry_run:
-                print(f"\n  [DRY RUN] Would reply to: {sender}")
+                print(f"\n  [DRY RUN] Would auto-send to: {sender} (confidence {confidence:.0%})")
                 print(f"  Reply preview:\n{reply_text[:400]}\n")
             else:
                 success = send_reply(SUPPORT_MAILBOX, msg_id, reply_html)
                 if success:
-                    print(f"    Reply sent to {sender}")
+                    print(f"    Auto-sent to {sender} (confidence {confidence:.0%})")
                     stats["replied"] += 1
                 else:
                     print(f"    Failed to send reply")
-
             mark_as_read(SUPPORT_MAILBOX, msg_id)
             move_to_processed(SUPPORT_MAILBOX, msg_id)
-            log_action(email, classification, "replied", confidence, reply_text)
+            log_action(email, classification, "auto_replied", confidence, reply_text)
 
         else:
-            reason = escalation_reason or f"Low confidence ({confidence:.2f})"
-            escalate_to_ken(email, classification, reply_text, reason, dry_run=dry_run)
+            # Below auto-send threshold — always send draft to Ken for approval
+            # (includes low confidence, needs_escalation, safety-critical-ish cases)
+            print(f"    Sending draft to Ken for approval (confidence {confidence:.0%}, escalation={needs_escalation})")
+            send_approval_to_ken(email, classification, reply_text, confidence, dry_run=dry_run)
             if not dry_run:
                 mark_as_read(SUPPORT_MAILBOX, msg_id)
                 move_to_processed(SUPPORT_MAILBOX, msg_id)
             stats["escalated"] += 1
-            print(f"    Escalated to Ken — {reason}")
-            log_action(email, classification, "escalated", confidence)
+            log_action(email, classification, "pending_approval", confidence, reply_text)
 
         print()
 
