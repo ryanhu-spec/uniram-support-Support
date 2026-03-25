@@ -8,6 +8,7 @@ Step 3: AI Auto-Reply Engine
 - Sends reply via Microsoft Graph API (reply-to-thread with original email quoted)
 - Escalates to Ken if confidence is low or question is too complex
 - Auto-learns: saves new Ken/Finn replies back to knowledge base
+- v19: Confidence threshold 0.65→0.45; smarter skip for internally-handled threads
 
 Changelog:
 - v2: Signature updated to "Technical Support" (single name Jennifer)
@@ -34,7 +35,7 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY, base_url="https://api.openai.com/
 # ─────────────────────────────────────────────
 ESCALATION_EMAIL     = "ken@uniram.com"
 ESCALATION_CC        = "finn.sun@uniram.com"
-CONFIDENCE_THRESHOLD = 0.65
+CONFIDENCE_THRESHOLD = 0.45  # Lowered from 0.65 — Jennifer should attempt to answer more
 DEFAULT_KB_PATH      = "/tmp/uniram_kb"
 LOG_PATH             = "/tmp/reply_log.jsonl"
 
@@ -744,13 +745,46 @@ NON_TECHNICAL_SKIP = [
     "calendar invite", "accepted:", "declined:", "tentative:"
 ]
 
+INTERNAL_DOMAINS = ["@uniram.com"]
+
+def is_internal_address(addr: str) -> bool:
+    return any(domain in addr.lower() for domain in INTERNAL_DOMAINS)
+
 def should_skip(email: dict) -> bool:
-    text = (email.get("subject", "") + " " + email.get("bodyPreview", "")).lower()
-    return any(kw in text for kw in NON_TECHNICAL_SKIP)
+    subject = email.get("subject", "")
+    body_preview = email.get("bodyPreview", "")
+    text = (subject + " " + body_preview).lower()
+
+    # Rule 1: Auto-reply / calendar noise
+    if any(kw in text for kw in NON_TECHNICAL_SKIP):
+        return True
+
+    # Rule 2: Already handled internally
+    # If email is forwarded by internal staff AND another internal staff is already CC'd,
+    # someone is already handling it — skip to avoid double-escalation to Ken
+    sender = email.get("from", {}).get("emailAddress", {}).get("address", "").lower()
+    cc_list = [r.get("emailAddress", {}).get("address", "").lower()
+               for r in email.get("ccRecipients", [])]
+    to_list = [r.get("emailAddress", {}).get("address", "").lower()
+               for r in email.get("toRecipients", [])]
+    all_recipients = cc_list + to_list
+
+    if is_internal_address(sender):
+        # Internal staff already CC'd (excluding support@ itself) means someone is on it
+        internal_cc = [a for a in all_recipients
+                       if is_internal_address(a) and "support@uniram.com" not in a]
+        if internal_cc:
+            return True
+
+    # Rule 3: [Support Escalation] replies bouncing back into inbox — already processed
+    if "[support escalation]" in subject.lower() and is_internal_address(sender):
+        return True
+
+    return False
 
 def process_emails(dry_run: bool = False, kb_path: str = DEFAULT_KB_PATH):
     print(f"\n{'='*60}")
-    print(f"  Uniram AI Support — Auto-Reply Engine v18")
+    print(f"  Uniram AI Support — Auto-Reply Engine v19")
     print(f"  Mode: {'DRY RUN (no emails sent)' if dry_run else 'LIVE'}")
     print(f"  Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}\n")
